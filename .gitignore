@@ -5,14 +5,20 @@
 *.so
 *.dylib
 
+# Compiled example binaries (no extension)
+[0-9][0-9]_*
+!/examples/[0-9][0-9]_*/
+
 # Test binary, built with `go test -c`
 *.test
 
 # Output of the go coverage tool
 *.out
+coverage.html
 
 # Go workspace file
 go.work
+go.work.sum
 
 # Dependency directories
 vendor/
@@ -31,6 +37,7 @@ Thumbs.db
 # Build output
 bin/
 dist/
+build/
 
 # Debug
 debug
@@ -39,3 +46,4 @@ debug
 # Environment
 .env
 .env.local
+.envrc
