@@ -3,34 +3,41 @@ package clawde
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
+	"time"
 )
 
-// Query handles the control protocol for a single query.
-type Query struct {
-	transport  Transport
-	opts       *Options
-	msgCh      chan Message
-	errCh      chan error
-	doneCh     chan struct{}
-	mu         sync.Mutex
-	started    bool
-	closed     bool
+// QueryHandler handles the control protocol for a single query.
+type QueryHandler struct {
+	transport        Transport
+	opts             *Options
+	msgCh            chan Message
+	errCh            chan error
+	doneCh           chan struct{}
+	mu               sync.Mutex
+	started          bool
+	closed           bool
+	initRequestID    string
+	initResponseCh   chan json.RawMessage
+	pendingResponses map[string]chan json.RawMessage
 }
 
-// NewQuery creates a new query handler.
-func NewQuery(transport Transport, opts *Options) *Query {
-	return &Query{
-		transport: transport,
-		opts:      opts,
-		msgCh:     make(chan Message, 100),
-		errCh:     make(chan error, 10),
-		doneCh:    make(chan struct{}),
+// NewQueryHandler creates a new query handler.
+func NewQueryHandler(transport Transport, opts *Options) *QueryHandler {
+	return &QueryHandler{
+		transport:        transport,
+		opts:             opts,
+		msgCh:            make(chan Message, 100),
+		errCh:            make(chan error, 10),
+		doneCh:           make(chan struct{}),
+		initResponseCh:   make(chan json.RawMessage, 1),
+		pendingResponses: make(map[string]chan json.RawMessage),
 	}
 }
 
 // Start begins processing messages from the transport.
-func (q *Query) Start(ctx context.Context) error {
+func (q *QueryHandler) Start(ctx context.Context) error {
 	q.mu.Lock()
 	if q.started {
 		q.mu.Unlock()
@@ -43,8 +50,96 @@ func (q *Query) Start(ctx context.Context) error {
 	return nil
 }
 
+// Initialize sends the initialization request to the CLI.
+// This must be called before sending prompts.
+func (q *QueryHandler) Initialize(ctx context.Context) error {
+	// Build hooks configuration
+	var hooksConfig map[string]any
+	if len(q.opts.Hooks) > 0 {
+		hooksConfig = make(map[string]any)
+		for event, matchers := range q.opts.Hooks {
+			var matcherConfigs []map[string]any
+			for _, matcher := range matchers {
+				matcherConfig := map[string]any{
+					"matcher":         matcher.ToolName,
+					"hookCallbackIds": []string{string(event) + "_callback"},
+				}
+				if matcher.Timeout > 0 {
+					matcherConfig["timeout"] = matcher.Timeout.Milliseconds()
+				}
+				matcherConfigs = append(matcherConfigs, matcherConfig)
+			}
+			hooksConfig[string(event)] = matcherConfigs
+		}
+	}
+
+	// Build MCP servers configuration
+	var mcpServersConfig map[string]any
+	if len(q.opts.SDKServers) > 0 {
+		mcpServersConfig = make(map[string]any)
+		for name, server := range q.opts.SDKServers {
+			// Register SDK MCP server with tools
+			var tools []map[string]any
+			for _, tool := range server.Tools {
+				tools = append(tools, map[string]any{
+					"name":        tool.Name,
+					"description": tool.Description,
+					"inputSchema": tool.InputSchema,
+				})
+			}
+			mcpServersConfig[name] = map[string]any{
+				"type":  "sdk",
+				"tools": tools,
+			}
+		}
+	}
+
+	// Build inner request
+	innerRequest := map[string]any{
+		"subtype": "initialize",
+	}
+	if hooksConfig != nil {
+		innerRequest["hooks"] = hooksConfig
+	}
+	if mcpServersConfig != nil {
+		innerRequest["mcp_servers"] = mcpServersConfig
+	}
+
+	// Generate request ID
+	q.mu.Lock()
+	q.initRequestID = fmt.Sprintf("init_%d", time.Now().UnixNano())
+	requestID := q.initRequestID
+	q.mu.Unlock()
+
+	// Send control request with correct format
+	controlRequest := map[string]any{
+		"type":       "control_request",
+		"request_id": requestID,
+		"request":    innerRequest,
+	}
+
+	data, err := json.Marshal(controlRequest)
+	if err != nil {
+		return err
+	}
+
+	if err := q.transport.Write(data); err != nil {
+		return err
+	}
+
+	// Wait for initialization response
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-q.initResponseCh:
+		return nil
+	case <-time.After(30 * time.Second):
+		return &ProtocolError{Message: "initialization timeout"}
+	}
+}
+
 // processLoop reads messages and handles control requests.
-func (q *Query) processLoop(ctx context.Context) {
+func (q *QueryHandler) processLoop(ctx context.Context) {
 	defer close(q.msgCh)
 
 	for {
@@ -75,6 +170,12 @@ func (q *Query) processLoop(ctx context.Context) {
 				continue
 			}
 
+			// Handle control response (response to our requests)
+			if envelope.Type == "control_response" {
+				q.handleControlResponse(raw)
+				continue
+			}
+
 			// Parse as regular message
 			msg, err := ParseMessage(raw)
 			if err != nil {
@@ -99,7 +200,7 @@ func (q *Query) processLoop(ctx context.Context) {
 }
 
 // handleControlRequest processes a control request and sends a response.
-func (q *Query) handleControlRequest(ctx context.Context, raw json.RawMessage) {
+func (q *QueryHandler) handleControlRequest(ctx context.Context, raw json.RawMessage) {
 	var req ControlRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		q.errCh <- &ParseError{Line: string(raw), Err: err}
@@ -150,13 +251,55 @@ func (q *Query) handleControlRequest(ctx context.Context, raw json.RawMessage) {
 	}
 }
 
+// handleControlResponse handles responses to control requests we sent.
+func (q *QueryHandler) handleControlResponse(raw json.RawMessage) {
+	// The control_response structure from CLI is:
+	// {"type": "control_response", "response": {"request_id": "...", "subtype": "success", "response": {...}}}
+	var envelope struct {
+		Type     string `json:"type"`
+		Response struct {
+			RequestID string          `json:"request_id"`
+			Subtype   string          `json:"subtype"`
+			Response  json.RawMessage `json:"response"`
+			Error     string          `json:"error,omitempty"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		q.errCh <- &ParseError{Line: string(raw), Err: err}
+		return
+	}
+
+	requestID := envelope.Response.RequestID
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Check if this is the init response
+	if requestID == q.initRequestID {
+		select {
+		case q.initResponseCh <- envelope.Response.Response:
+		default:
+		}
+		return
+	}
+
+	// Check for other pending responses
+	if ch, ok := q.pendingResponses[requestID]; ok {
+		select {
+		case ch <- envelope.Response.Response:
+		default:
+		}
+		delete(q.pendingResponses, requestID)
+	}
+}
+
 // handleInitialize handles initialization requests.
-func (q *Query) handleInitialize(req *InitializeRequest) *InitializeResponse {
+func (q *QueryHandler) handleInitialize(req *InitializeRequest) *InitializeResponse {
 	return &InitializeResponse{Success: true}
 }
 
 // handleCanUseTool handles permission requests.
-func (q *Query) handleCanUseTool(ctx context.Context, req *CanUseToolRequest) *CanUseToolResponse {
+func (q *QueryHandler) handleCanUseTool(ctx context.Context, req *CanUseToolRequest) *CanUseToolResponse {
 	// If no callback, allow by default
 	if q.opts.PermissionCallback == nil {
 		return &CanUseToolResponse{Allowed: true}
@@ -188,7 +331,7 @@ func (q *Query) handleCanUseTool(ctx context.Context, req *CanUseToolRequest) *C
 }
 
 // handleHookCallback handles hook callbacks.
-func (q *Query) handleHookCallback(ctx context.Context, req *HookCallbackRequest) *HookCallbackResponse {
+func (q *QueryHandler) handleHookCallback(ctx context.Context, req *HookCallbackRequest) *HookCallbackResponse {
 	event := HookEvent(req.Event)
 	matchers, ok := q.opts.Hooks[event]
 	if !ok || len(matchers) == 0 {
@@ -203,13 +346,15 @@ func (q *Query) handleHookCallback(ctx context.Context, req *HookCallbackRequest
 
 		// Apply timeout if specified
 		callCtx := ctx
+		var cancel context.CancelFunc
 		if matcher.Timeout > 0 {
-			var cancel context.CancelFunc
 			callCtx, cancel = context.WithTimeout(ctx, matcher.Timeout)
-			defer cancel()
 		}
 
 		output, err := matcher.Callback(callCtx, req.Input)
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			return &HookCallbackResponse{
 				Continue: false,
@@ -233,7 +378,7 @@ func (q *Query) handleHookCallback(ctx context.Context, req *HookCallbackRequest
 }
 
 // handleMCPMessage handles MCP server messages.
-func (q *Query) handleMCPMessage(ctx context.Context, req *MCPMessageRequest) *MCPMessageResponse {
+func (q *QueryHandler) handleMCPMessage(ctx context.Context, req *MCPMessageRequest) *MCPMessageResponse {
 	server, ok := q.opts.SDKServers[req.ServerName]
 	if !ok {
 		return &MCPMessageResponse{
@@ -252,10 +397,17 @@ func (q *Query) handleMCPMessage(ctx context.Context, req *MCPMessageRequest) *M
 }
 
 // SendPrompt sends a user prompt.
-func (q *Query) SendPrompt(prompt string) error {
+func (q *QueryHandler) SendPrompt(prompt string) error {
+	// Format must match what the CLI expects:
+	// {"type": "user", "message": {"role": "user", "content": "..."}, ...}
 	msg := map[string]any{
-		"type":   "user_message",
-		"prompt": prompt,
+		"type": "user",
+		"message": map[string]any{
+			"role":    "user",
+			"content": prompt,
+		},
+		"parent_tool_use_id": nil,
+		"session_id":         nil,
 	}
 
 	data, err := json.Marshal(msg)
@@ -267,17 +419,17 @@ func (q *Query) SendPrompt(prompt string) error {
 }
 
 // Messages returns the message channel.
-func (q *Query) Messages() <-chan Message {
+func (q *QueryHandler) Messages() <-chan Message {
 	return q.msgCh
 }
 
 // Errors returns the error channel.
-func (q *Query) Errors() <-chan error {
+func (q *QueryHandler) Errors() <-chan error {
 	return q.errCh
 }
 
 // Close shuts down the query.
-func (q *Query) Close() error {
+func (q *QueryHandler) Close() error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 

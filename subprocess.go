@@ -121,9 +121,18 @@ func (t *SubprocessTransport) findCLI() (string, error) {
 
 // buildArgs constructs command line arguments.
 func (t *SubprocessTransport) buildArgs() []string {
-	args := []string{"--output-format", "stream-json"}
+	args := []string{"--output-format", "stream-json", "--verbose", "--input-format", "stream-json"}
 
-	if t.opts.SystemPrompt != "" {
+	// System prompt - handle both simple string and config
+	if t.opts.SystemPromptConfig != nil {
+		if t.opts.SystemPromptConfig.Preset != nil {
+			// JSON format for preset
+			jsonBytes, _ := json.Marshal(t.opts.SystemPromptConfig.Preset)
+			args = append(args, "--system-prompt", string(jsonBytes))
+		} else if t.opts.SystemPromptConfig.String != "" {
+			args = append(args, "--system-prompt", t.opts.SystemPromptConfig.String)
+		}
+	} else if t.opts.SystemPrompt != "" {
 		args = append(args, "--system-prompt", t.opts.SystemPrompt)
 	}
 
@@ -151,6 +160,18 @@ func (t *SubprocessTransport) buildArgs() []string {
 		args = append(args, "--disallowed-tools", strings.Join(t.opts.DisallowedTools, ","))
 	}
 
+	// Tools option (array or preset)
+	if t.opts.Tools != nil {
+		if t.opts.Tools.Preset != nil {
+			jsonBytes, _ := json.Marshal(t.opts.Tools.Preset)
+			args = append(args, "--tools", string(jsonBytes))
+		} else {
+			// Array of tools (or empty array to disable all tools)
+			jsonBytes, _ := json.Marshal(t.opts.Tools.Tools)
+			args = append(args, "--tools", string(jsonBytes))
+		}
+	}
+
 	if t.opts.PermissionMode != "" {
 		args = append(args, "--permission-mode", string(t.opts.PermissionMode))
 	}
@@ -162,6 +183,43 @@ func (t *SubprocessTransport) buildArgs() []string {
 	// Add MCP server configurations
 	for name, cfg := range t.opts.MCPServers {
 		args = append(args, "--mcp", formatMCPConfig(name, cfg))
+	}
+
+	// Add agents
+	if len(t.opts.Agents) > 0 {
+		agentsJSON, _ := json.Marshal(t.opts.Agents)
+		args = append(args, "--agents", string(agentsJSON))
+	}
+
+	// Add setting sources - always pass this to isolate from user/project settings
+	var sourcesValue string
+	if len(t.opts.SettingSources) > 0 {
+		sources := make([]string, len(t.opts.SettingSources))
+		for i, s := range t.opts.SettingSources {
+			sources[i] = string(s)
+		}
+		sourcesValue = strings.Join(sources, ",")
+	}
+	args = append(args, "--setting-sources", sourcesValue)
+
+	// Add plugins
+	for _, plugin := range t.opts.Plugins {
+		pluginJSON, _ := json.Marshal(plugin)
+		args = append(args, "--plugin", string(pluginJSON))
+	}
+
+	// Include partial messages
+	if t.opts.IncludePartialMessages {
+		args = append(args, "--include-partial-messages")
+	}
+
+	// Extra args
+	for key, value := range t.opts.ExtraArgs {
+		if value == "" {
+			args = append(args, "--"+key)
+		} else {
+			args = append(args, "--"+key, value)
+		}
 	}
 
 	return args
@@ -220,18 +278,20 @@ func (t *SubprocessTransport) readStderr() {
 	var stderr strings.Builder
 
 	for scanner.Scan() {
-		stderr.WriteString(scanner.Text())
+		line := scanner.Text()
+
+		// Call stderr callback if provided
+		if t.opts.StderrCallback != nil {
+			t.opts.StderrCallback(line)
+		}
+
+		stderr.WriteString(line)
 		stderr.WriteString("\n")
 	}
 
-	// Store stderr for potential error reporting
-	t.mu.Lock()
-	stderrStr := stderr.String()
-	t.mu.Unlock()
-
-	if stderrStr != "" {
+	if stderr.Len() > 0 {
 		select {
-		case t.errCh <- &ProcessError{Stderr: stderrStr}:
+		case t.errCh <- &ProcessError{Stderr: stderr.String()}:
 		case <-t.doneCh:
 		}
 	}

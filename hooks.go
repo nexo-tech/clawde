@@ -52,11 +52,23 @@ type HookInput struct {
 	// ToolName is the name of the tool (for tool hooks).
 	ToolName string
 
+	// ToolUseID is the unique ID of the tool use.
+	ToolUseID string
+
+	// ParentToolUseID is the ID of the parent tool use (for subagent calls).
+	ParentToolUseID *string
+
 	// ToolInput is the raw JSON input for the tool.
 	ToolInput json.RawMessage
 
+	// ToolInputMap is the parsed tool input as a map for convenience.
+	ToolInputMap map[string]interface{}
+
 	// ToolOutput is the raw JSON output from the tool (PostToolUse only).
 	ToolOutput json.RawMessage
+
+	// ToolResult is the parsed tool result as a map for convenience.
+	ToolResult map[string]interface{}
 
 	// Prompt is the user prompt (UserPromptSubmit only).
 	Prompt string

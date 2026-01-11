@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 // MCPServerConfig configures an external MCP server.
@@ -61,10 +62,7 @@ type ToolContent struct {
 
 // NewMCPServer creates a new in-process MCP server.
 func NewMCPServer(name string) *MCPServer {
-	return &MCPServer{
-		Name:  name,
-		Tools: make([]*MCPTool, 0),
-	}
+	return &MCPServer{Name: name}
 }
 
 // AddTool adds a tool to the MCP server.
@@ -224,18 +222,7 @@ func typeToSchema(t reflect.Type) map[string]any {
 
 // splitTag splits a struct tag value.
 func splitTag(tag string) []string {
-	var parts []string
-	current := ""
-	for _, c := range tag {
-		if c == ',' {
-			parts = append(parts, current)
-			current = ""
-		} else {
-			current += string(c)
-		}
-	}
-	parts = append(parts, current)
-	return parts
+	return strings.Split(tag, ",")
 }
 
 // HandleMCPRequest handles an MCP request for SDK servers.

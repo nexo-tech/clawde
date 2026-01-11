@@ -13,8 +13,10 @@ type Message interface {
 
 // UserMessage represents a message from the user.
 type UserMessage struct {
-	Role    string         `json:"role"`
-	Content []ContentBlock `json:"content"`
+	Role            string         `json:"role"`
+	Content         []ContentBlock `json:"content"`
+	UUID            string         `json:"uuid,omitempty"`
+	ParentToolUseID *string        `json:"parent_tool_use_id,omitempty"`
 }
 
 func (UserMessage) isMessage() {}
@@ -32,8 +34,11 @@ func (m *UserMessage) Text() string {
 
 // AssistantMessage represents a message from Claude.
 type AssistantMessage struct {
-	Role    string         `json:"role"`
-	Content []ContentBlock `json:"content"`
+	Role            string         `json:"role"`
+	Content         []ContentBlock `json:"content"`
+	Model           string         `json:"model,omitempty"`
+	ParentToolUseID *string        `json:"parent_tool_use_id,omitempty"`
+	Error           *string        `json:"error,omitempty"`
 }
 
 func (AssistantMessage) isMessage() {}
@@ -137,12 +142,16 @@ func (ToolUseBlock) Type() string { return "tool_use" }
 
 // ToolResultBlock represents the result of a tool invocation.
 type ToolResultBlock struct {
-	ToolUseID string `json:"tool_use_id"`
-	Content   string `json:"content"`
-	IsError   bool   `json:"is_error,omitempty"`
+	ToolUseID     string          `json:"tool_use_id"`
+	Content       json.RawMessage `json:"-"` // Can be string or array of content blocks
+	ContentString string          `json:"-"` // Extracted text content
+	IsError       bool            `json:"is_error,omitempty"`
 }
 
 func (ToolResultBlock) Type() string { return "tool_result" }
+
+// Text returns the content as a string.
+func (b *ToolResultBlock) Text() string { return b.ContentString }
 
 // ImageBlock represents an image content block.
 type ImageBlock struct {

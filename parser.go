@@ -3,14 +3,15 @@ package clawde
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ParseMessage parses a raw JSON message into a typed Message.
 func ParseMessage(data json.RawMessage) (Message, error) {
 	// First, determine the message type
+	// CLI sends: {"type": "user", "message": {...}} or {"type": "assistant", "message": {...}}
 	var envelope struct {
 		Type    string `json:"type"`
-		Role    string `json:"role"`
 		Subtype string `json:"subtype"`
 	}
 
@@ -18,22 +19,24 @@ func ParseMessage(data json.RawMessage) (Message, error) {
 		return nil, &ParseError{Line: string(data), Err: err}
 	}
 
-	// Route based on type/role
-	switch {
-	case envelope.Role == "user":
+	// Route based on type
+	switch envelope.Type {
+	case "user":
 		return parseUserMessage(data)
-	case envelope.Role == "assistant":
+	case "assistant":
 		return parseAssistantMessage(data)
-	case envelope.Type == "system":
+	case "system":
 		return parseSystemMessage(data)
-	case envelope.Type == "result":
+	case "result":
 		return parseResultMessage(data)
-	case envelope.Type == "content_block_start",
-		envelope.Type == "content_block_delta",
-		envelope.Type == "content_block_stop",
-		envelope.Type == "message_start",
-		envelope.Type == "message_delta",
-		envelope.Type == "message_stop":
+	case "stream_event":
+		return parseStreamEvent(data)
+	case "content_block_start",
+		"content_block_delta",
+		"content_block_stop",
+		"message_start",
+		"message_delta",
+		"message_stop":
 		return parseStreamEvent(data)
 	default:
 		// Return as system message for unknown types
@@ -42,29 +45,37 @@ func ParseMessage(data json.RawMessage) (Message, error) {
 }
 
 // parseUserMessage parses a user message.
+// CLI sends: {"type": "user", "message": {"role": "user", "content": "..."}, "uuid": "...", "parent_tool_use_id": ...}
 func parseUserMessage(data json.RawMessage) (*UserMessage, error) {
 	var raw struct {
-		Role    string            `json:"role"`
-		Content json.RawMessage   `json:"content"`
-		RawContent []json.RawMessage `json:"-"`
+		Type             string `json:"type"`
+		UUID             string `json:"uuid"`
+		ParentToolUseID  *string `json:"parent_tool_use_id"`
+		Message          struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
 	}
 
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, &ParseError{Line: string(data), Err: err}
 	}
 
-	msg := &UserMessage{Role: raw.Role}
+	msg := &UserMessage{
+		Role: raw.Message.Role,
+		UUID: raw.UUID,
+	}
 
 	// Content can be a string or array of blocks
 	var contentStr string
-	if err := json.Unmarshal(raw.Content, &contentStr); err == nil {
+	if err := json.Unmarshal(raw.Message.Content, &contentStr); err == nil {
 		msg.Content = []ContentBlock{&TextBlock{Text: contentStr}}
 		return msg, nil
 	}
 
 	// Try as array
 	var blocks []json.RawMessage
-	if err := json.Unmarshal(raw.Content, &blocks); err != nil {
+	if err := json.Unmarshal(raw.Message.Content, &blocks); err != nil {
 		return nil, &ParseError{Line: string(data), Err: fmt.Errorf("invalid content format")}
 	}
 
@@ -80,19 +91,29 @@ func parseUserMessage(data json.RawMessage) (*UserMessage, error) {
 }
 
 // parseAssistantMessage parses an assistant message.
+// CLI sends: {"type": "assistant", "message": {"role": "assistant", "content": [...], "model": "..."}, "parent_tool_use_id": ...}
 func parseAssistantMessage(data json.RawMessage) (*AssistantMessage, error) {
 	var raw struct {
-		Role    string            `json:"role"`
-		Content []json.RawMessage `json:"content"`
+		Type            string  `json:"type"`
+		ParentToolUseID *string `json:"parent_tool_use_id"`
+		Message         struct {
+			Role    string            `json:"role"`
+			Content []json.RawMessage `json:"content"`
+			Model   string            `json:"model"`
+			Error   *string           `json:"error"`
+		} `json:"message"`
 	}
 
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, &ParseError{Line: string(data), Err: err}
 	}
 
-	msg := &AssistantMessage{Role: raw.Role}
+	msg := &AssistantMessage{
+		Role:  raw.Message.Role,
+		Model: raw.Message.Model,
+	}
 
-	for _, block := range raw.Content {
+	for _, block := range raw.Message.Content {
 		cb, err := parseContentBlock(block)
 		if err != nil {
 			return nil, err
@@ -163,11 +184,44 @@ func parseContentBlock(data json.RawMessage) (ContentBlock, error) {
 		return &block, nil
 
 	case "tool_result":
-		var block ToolResultBlock
-		if err := json.Unmarshal(data, &block); err != nil {
+		// ToolResultBlock content can be string or array of content blocks
+		var raw struct {
+			ToolUseID string          `json:"tool_use_id"`
+			Content   json.RawMessage `json:"content"`
+			IsError   bool            `json:"is_error,omitempty"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
 			return nil, &ParseError{Line: string(data), Err: err}
 		}
-		return &block, nil
+
+		block := &ToolResultBlock{
+			ToolUseID: raw.ToolUseID,
+			Content:   raw.Content,
+			IsError:   raw.IsError,
+		}
+
+		// Try to extract content as string
+		var contentStr string
+		if err := json.Unmarshal(raw.Content, &contentStr); err == nil {
+			block.ContentString = contentStr
+		} else {
+			// Try as array of content blocks and extract text
+			var contentBlocks []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(raw.Content, &contentBlocks); err == nil {
+				var texts []string
+				for _, cb := range contentBlocks {
+					if cb.Type == "text" && cb.Text != "" {
+						texts = append(texts, cb.Text)
+					}
+				}
+				block.ContentString = strings.Join(texts, "\n")
+			}
+		}
+
+		return block, nil
 
 	case "image":
 		var block ImageBlock

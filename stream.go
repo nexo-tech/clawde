@@ -7,15 +7,16 @@ import (
 
 // Stream provides iteration over query responses.
 type Stream struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	msgCh   <-chan Message
-	errCh   <-chan error
-	current Message
-	err     error
-	done    bool
-	message *AssistantMessage // accumulated message
-	result  *ResultMessage    // final result
+	ctx           context.Context
+	cancel        context.CancelFunc
+	msgCh         <-chan Message
+	errCh         <-chan error
+	current       Message
+	err           error
+	done          bool
+	message       *AssistantMessage // accumulated message
+	result        *ResultMessage    // final result
+	managedClient *Client           // client to close when stream is done (set by Query func)
 }
 
 // NewStream creates a new response stream.
@@ -104,10 +105,13 @@ func (s *Stream) Err() error {
 	return s.err
 }
 
-// Close cancels the stream.
+// Close cancels the stream and closes the managed client if set.
 func (s *Stream) Close() error {
 	s.cancel()
 	s.done = true
+	if s.managedClient != nil {
+		return s.managedClient.Close()
+	}
 	return nil
 }
 

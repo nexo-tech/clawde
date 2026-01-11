@@ -22,11 +22,10 @@ func Query(ctx context.Context, prompt string, opts ...Option) (*Stream, error) 
 		return nil, err
 	}
 
-	// Wrap stream to close client when done
-	return &managedStream{
-		Stream: stream,
-		client: client,
-	}, nil
+	// Set the client on the stream for automatic cleanup
+	stream.managedClient = client
+
+	return stream, nil
 }
 
 // QueryText performs a query and returns just the text response.
@@ -49,25 +48,4 @@ func QueryResult(ctx context.Context, prompt string, opts ...Option) ([]Message,
 	defer stream.Close()
 
 	return stream.Collect()
-}
-
-// managedStream wraps a Stream and closes the client when done.
-type managedStream struct {
-	*Stream
-	client *Client
-}
-
-// Close closes both the stream and the underlying client.
-func (s *managedStream) Close() error {
-	s.Stream.Close()
-	return s.client.Close()
-}
-
-// Next wraps the underlying Next and closes client when done.
-func (s *managedStream) Next() bool {
-	if !s.Stream.Next() {
-		s.client.Close()
-		return false
-	}
-	return true
 }

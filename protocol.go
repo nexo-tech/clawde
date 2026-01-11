@@ -82,15 +82,16 @@ type MCPError struct {
 
 // parseControlRequest parses the inner request of a ControlRequest.
 func parseControlRequest(req *ControlRequest) (any, error) {
+	// The CLI sends control requests with "subtype" field to identify the request type
 	var envelope struct {
-		Type string `json:"type"`
+		Subtype string `json:"subtype"`
 	}
 
 	if err := json.Unmarshal(req.Request, &envelope); err != nil {
 		return nil, err
 	}
 
-	switch envelope.Type {
+	switch envelope.Subtype {
 	case "initialize":
 		var init InitializeRequest
 		if err := json.Unmarshal(req.Request, &init); err != nil {
@@ -120,6 +121,6 @@ func parseControlRequest(req *ControlRequest) (any, error) {
 		return &mcp, nil
 
 	default:
-		return nil, &ProtocolError{Message: "unknown request type: " + envelope.Type}
+		return nil, &ProtocolError{Message: "unknown request subtype: " + envelope.Subtype}
 	}
 }

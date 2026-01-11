@@ -9,7 +9,7 @@ import (
 type Client struct {
 	opts      *Options
 	transport Transport
-	query     *Query
+	query     *QueryHandler
 	mu        sync.RWMutex
 	connected bool
 }
@@ -41,8 +41,14 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	// Create and start query handler
-	c.query = NewQuery(c.transport, c.opts)
+	c.query = NewQueryHandler(c.transport, c.opts)
 	if err := c.query.Start(ctx); err != nil {
+		c.transport.Close()
+		return err
+	}
+
+	// Send initialization request
+	if err := c.query.Initialize(ctx); err != nil {
 		c.transport.Close()
 		return err
 	}
