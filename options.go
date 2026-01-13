@@ -161,6 +161,10 @@ type Options struct {
 	// Timeout is the maximum duration for a query.
 	Timeout time.Duration
 
+	// MaxThinkingTokens enables extended thinking with the specified token budget.
+	// Minimum is 1024 tokens. Set to 0 to disable.
+	MaxThinkingTokens int
+
 	// ResumeConversation continues an existing conversation.
 	ResumeConversation string
 
@@ -300,6 +304,14 @@ func WithEnv(env map[string]string) Option {
 func WithTimeout(d time.Duration) Option {
 	return func(o *Options) {
 		o.Timeout = d
+	}
+}
+
+// WithMaxThinkingTokens enables extended thinking with the specified token budget.
+// Minimum is 1024 tokens. Set to 0 to disable extended thinking.
+func WithMaxThinkingTokens(tokens int) Option {
+	return func(o *Options) {
+		o.MaxThinkingTokens = tokens
 	}
 }
 

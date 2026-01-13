@@ -152,6 +152,10 @@ func (t *SubprocessTransport) buildArgs() []string {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", t.opts.MaxBudgetUSD))
 	}
 
+	if t.opts.MaxThinkingTokens > 0 {
+		args = append(args, "--max-thinking-tokens", fmt.Sprintf("%d", t.opts.MaxThinkingTokens))
+	}
+
 	if len(t.opts.AllowedTools) > 0 {
 		args = append(args, "--allowed-tools", strings.Join(t.opts.AllowedTools, ","))
 	}
@@ -191,16 +195,15 @@ func (t *SubprocessTransport) buildArgs() []string {
 		args = append(args, "--agents", string(agentsJSON))
 	}
 
-	// Add setting sources - always pass this to isolate from user/project settings
-	var sourcesValue string
+	// Add setting sources - only pass if explicitly configured
+	// If not configured, let Claude CLI use its defaults (which include project settings)
 	if len(t.opts.SettingSources) > 0 {
 		sources := make([]string, len(t.opts.SettingSources))
 		for i, s := range t.opts.SettingSources {
 			sources[i] = string(s)
 		}
-		sourcesValue = strings.Join(sources, ",")
+		args = append(args, "--setting-sources", strings.Join(sources, ","))
 	}
-	args = append(args, "--setting-sources", sourcesValue)
 
 	// Add plugins
 	for _, plugin := range t.opts.Plugins {
@@ -241,34 +244,75 @@ func formatMCPConfig(name string, cfg MCPServerConfig) string {
 	return strings.Join(parts, ":")
 }
 
-// readLoop reads JSON messages from stdout.
+// readLoop reads JSON messages from stdout using a streaming reader.
+// Uses bufio.Reader instead of Scanner for lower latency - ReadSlice returns
+// data immediately when a newline is found, rather than waiting for more input.
 func (t *SubprocessTransport) readLoop() {
-	scanner := bufio.NewScanner(t.stdout)
-	// Increase buffer size for large messages
-	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
+	reader := bufio.NewReaderSize(t.stdout, 64*1024) // 64KB buffer for faster reads
+	var accumulator []byte                           // For lines longer than buffer
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	for {
+		line, err := reader.ReadSlice('\n')
+		if err != nil {
+			if err == bufio.ErrBufferFull {
+				// Line is longer than buffer, accumulate it
+				accumulator = append(accumulator, line...)
+				continue
+			}
+			if err == io.EOF {
+				// Process any remaining accumulated data
+				if len(accumulator) > 0 {
+					t.sendLine(accumulator)
+				}
+				return
+			}
+			// Other error
+			select {
+			case t.errCh <- &ParseError{Err: err}:
+			case <-t.doneCh:
+			}
+			return
+		}
+
+		// Got a complete line (ends with \n)
+		if len(accumulator) > 0 {
+			// Had partial data, combine with this line
+			accumulator = append(accumulator, line...)
+			line = accumulator
+			accumulator = nil
+		}
+
+		// Trim the newline
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			line = line[:len(line)-1]
+		}
+		// Also trim carriage return if present (Windows line endings)
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+
 		if len(line) == 0 {
 			continue
 		}
 
-		// Make a copy of the line data
-		msg := make(json.RawMessage, len(line))
-		copy(msg, line)
-
-		select {
-		case t.msgCh <- msg:
-		case <-t.doneCh:
+		// Send the line immediately
+		if !t.sendLine(line) {
 			return
 		}
 	}
+}
 
-	if err := scanner.Err(); err != nil {
-		select {
-		case t.errCh <- &ParseError{Err: err}:
-		case <-t.doneCh:
-		}
+// sendLine sends a line to the message channel, returning false if done.
+func (t *SubprocessTransport) sendLine(line []byte) bool {
+	// Make a copy since the buffer may be reused
+	msg := make(json.RawMessage, len(line))
+	copy(msg, line)
+
+	select {
+	case t.msgCh <- msg:
+		return true
+	case <-t.doneCh:
+		return false
 	}
 }
 
