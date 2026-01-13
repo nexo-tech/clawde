@@ -47,34 +47,35 @@ type HookCallback func(ctx context.Context, input *HookInput) (*HookOutput, erro
 // HookInput contains information about the hook event.
 type HookInput struct {
 	// SessionID is the current session ID.
-	SessionID string
+	SessionID string `json:"session_id"`
 
 	// ToolName is the name of the tool (for tool hooks).
-	ToolName string
+	ToolName string `json:"tool_name"`
 
 	// ToolUseID is the unique ID of the tool use.
-	ToolUseID string
+	ToolUseID string `json:"tool_use_id"`
 
 	// ParentToolUseID is the ID of the parent tool use (for subagent calls).
-	ParentToolUseID *string
+	ParentToolUseID *string `json:"parent_tool_use_id,omitempty"`
 
 	// ToolInput is the raw JSON input for the tool.
-	ToolInput json.RawMessage
+	ToolInput json.RawMessage `json:"tool_input"`
 
 	// ToolInputMap is the parsed tool input as a map for convenience.
-	ToolInputMap map[string]interface{}
+	ToolInputMap map[string]interface{} `json:"-"`
 
 	// ToolOutput is the raw JSON output from the tool (PostToolUse only).
-	ToolOutput json.RawMessage
+	// Note: CLI sends this as "tool_response" in the JSON.
+	ToolOutput json.RawMessage `json:"tool_response"`
 
 	// ToolResult is the parsed tool result as a map for convenience.
-	ToolResult map[string]interface{}
+	ToolResult map[string]interface{} `json:"-"`
 
 	// Prompt is the user prompt (UserPromptSubmit only).
-	Prompt string
+	Prompt string `json:"prompt,omitempty"`
 
 	// StopReason is the reason for stopping (Stop/SubagentStop only).
-	StopReason string
+	StopReason string `json:"stop_reason,omitempty"`
 }
 
 // Command extracts the command from a Bash tool input.

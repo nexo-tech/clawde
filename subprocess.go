@@ -250,12 +250,27 @@ func formatMCPConfig(name string, cfg MCPServerConfig) string {
 func (t *SubprocessTransport) readLoop() {
 	reader := bufio.NewReaderSize(t.stdout, 64*1024) // 64KB buffer for faster reads
 	var accumulator []byte                           // For lines longer than buffer
+	msgCount := 0
 
 	for {
+		// Log that we're waiting for data
+		if t.opts.StderrCallback != nil {
+			t.opts.StderrCallback(fmt.Sprintf("[clawde] readLoop: waiting for line %d...", msgCount+1))
+		}
+
 		line, err := reader.ReadSlice('\n')
+
+		// Log immediately when we get data
+		if t.opts.StderrCallback != nil && len(line) > 0 {
+			t.opts.StderrCallback(fmt.Sprintf("[clawde] readLoop: got %d bytes for line %d", len(line), msgCount+1))
+		}
+
 		if err != nil {
 			if err == bufio.ErrBufferFull {
 				// Line is longer than buffer, accumulate it
+				if t.opts.StderrCallback != nil {
+					t.opts.StderrCallback(fmt.Sprintf("[clawde] readLoop: buffer full, accumulating %d bytes", len(line)))
+				}
 				accumulator = append(accumulator, line...)
 				continue
 			}
@@ -264,9 +279,15 @@ func (t *SubprocessTransport) readLoop() {
 				if len(accumulator) > 0 {
 					t.sendLine(accumulator)
 				}
+				if t.opts.StderrCallback != nil {
+					t.opts.StderrCallback(fmt.Sprintf("[clawde] readLoop: EOF after %d messages", msgCount))
+				}
 				return
 			}
 			// Other error
+			if t.opts.StderrCallback != nil {
+				t.opts.StderrCallback(fmt.Sprintf("[clawde] readLoop: error: %v", err))
+			}
 			select {
 			case t.errCh <- &ParseError{Err: err}:
 			case <-t.doneCh:
@@ -295,6 +316,7 @@ func (t *SubprocessTransport) readLoop() {
 			continue
 		}
 
+		msgCount++
 		// Send the line immediately
 		if !t.sendLine(line) {
 			return

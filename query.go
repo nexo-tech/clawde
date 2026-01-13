@@ -58,6 +58,9 @@ func (q *QueryHandler) Initialize(ctx context.Context) error {
 	if len(q.opts.Hooks) > 0 {
 		hooksConfig = make(map[string]any)
 		for event, matchers := range q.opts.Hooks {
+			if q.opts.StderrCallback != nil {
+				q.opts.StderrCallback(fmt.Sprintf("[clawde] Initialize: registering hook event=%s matchers=%d", event, len(matchers)))
+			}
 			var matcherConfigs []map[string]any
 			for _, matcher := range matchers {
 				matcherConfig := map[string]any{
@@ -68,8 +71,15 @@ func (q *QueryHandler) Initialize(ctx context.Context) error {
 					matcherConfig["timeout"] = matcher.Timeout.Milliseconds()
 				}
 				matcherConfigs = append(matcherConfigs, matcherConfig)
+				if q.opts.StderrCallback != nil {
+					q.opts.StderrCallback(fmt.Sprintf("[clawde] Initialize: hook matcher tool=%s callback_id=%s", matcher.ToolName, string(event)+"_callback"))
+				}
 			}
 			hooksConfig[string(event)] = matcherConfigs
+		}
+	} else {
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback("[clawde] Initialize: no hooks registered")
 		}
 	}
 
@@ -165,6 +175,10 @@ func (q *QueryHandler) processLoop(ctx context.Context) {
 				continue
 			}
 
+			if q.opts.StderrCallback != nil {
+				q.opts.StderrCallback(fmt.Sprintf("[clawde] processLoop: received type=%s len=%d", envelope.Type, len(raw)))
+			}
+
 			if envelope.Type == "control_request" {
 				q.handleControlRequest(ctx, raw)
 				continue
@@ -173,6 +187,14 @@ func (q *QueryHandler) processLoop(ctx context.Context) {
 			// Handle control response (response to our requests)
 			if envelope.Type == "control_response" {
 				q.handleControlResponse(raw)
+				continue
+			}
+
+			// Handle control cancel request (CLI cancelling a pending callback)
+			if envelope.Type == "control_cancel_request" {
+				if q.opts.StderrCallback != nil {
+					q.opts.StderrCallback("[clawde] processLoop: ignoring control_cancel_request (no pending callbacks)")
+				}
 				continue
 			}
 
@@ -203,12 +225,22 @@ func (q *QueryHandler) processLoop(ctx context.Context) {
 func (q *QueryHandler) handleControlRequest(ctx context.Context, raw json.RawMessage) {
 	var req ControlRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: parse error: %v", err))
+		}
 		q.errCh <- &ParseError{Line: string(raw), Err: err}
 		return
 	}
 
+	if q.opts.StderrCallback != nil {
+		q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: request_id=%s", req.RequestID))
+	}
+
 	innerReq, err := parseControlRequest(&req)
 	if err != nil {
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: parseControlRequest error: %v", err))
+		}
 		q.errCh <- err
 		return
 	}
@@ -217,36 +249,67 @@ func (q *QueryHandler) handleControlRequest(ctx context.Context, raw json.RawMes
 
 	switch r := innerReq.(type) {
 	case *InitializeRequest:
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback("[clawde] handleControlRequest: InitializeRequest")
+		}
 		response = q.handleInitialize(r)
 
 	case *CanUseToolRequest:
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: CanUseToolRequest tool=%s", r.ToolName))
+		}
 		response = q.handleCanUseTool(ctx, r)
 
 	case *HookCallbackRequest:
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: HookCallbackRequest event=%s callback_id=%s", r.Event, r.CallbackID))
+			// Debug: log raw request to understand structure
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: raw_request=%s", string(req.Request)))
+		}
 		response = q.handleHookCallback(ctx, r)
 
 	case *MCPMessageRequest:
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: MCPMessageRequest server=%s", r.ServerName))
+		}
 		response = q.handleMCPMessage(ctx, r)
 
 	default:
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback("[clawde] handleControlRequest: unknown request type")
+		}
 		q.errCh <- &ProtocolError{Message: "unknown request type"}
 		return
 	}
 
-	// Send response
-	resp := ControlResponse{
-		Type:      "control_response",
-		RequestID: req.RequestID,
-		Response:  response,
+	// Send response - must match Python SDK format:
+	// {"type": "control_response", "response": {"subtype": "success", "request_id": "...", "response": {...}}}
+	resp := map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"subtype":    "success",
+			"request_id": req.RequestID,
+			"response":   response,
+		},
 	}
 
 	respJSON, err := json.Marshal(resp)
 	if err != nil {
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: marshal error: %v", err))
+		}
 		q.errCh <- err
 		return
 	}
 
+	if q.opts.StderrCallback != nil {
+		q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: sending response len=%d", len(respJSON)))
+	}
+
 	if err := q.transport.Write(respJSON); err != nil {
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleControlRequest: write error: %v", err))
+		}
 		q.errCh <- err
 	}
 }
@@ -332,16 +395,44 @@ func (q *QueryHandler) handleCanUseTool(ctx context.Context, req *CanUseToolRequ
 
 // handleHookCallback handles hook callbacks.
 func (q *QueryHandler) handleHookCallback(ctx context.Context, req *HookCallbackRequest) *HookCallbackResponse {
+	// Extract event from callback_id if event field is empty
+	// CLI sends callback_id like "PreToolUse_callback" instead of event field
 	event := HookEvent(req.Event)
+	if event == "" && req.CallbackID != "" {
+		// Strip "_callback" suffix to get event name
+		eventStr := req.CallbackID
+		if len(eventStr) > 9 && eventStr[len(eventStr)-9:] == "_callback" {
+			eventStr = eventStr[:len(eventStr)-9]
+		}
+		event = HookEvent(eventStr)
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleHookCallback: extracted event=%s from callback_id=%s", event, req.CallbackID))
+		}
+	}
+
 	matchers, ok := q.opts.Hooks[event]
 	if !ok || len(matchers) == 0 {
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleHookCallback: no matchers for event=%s", event))
+		}
 		return &HookCallbackResponse{Continue: true}
 	}
 
-	for _, matcher := range matchers {
+	if q.opts.StderrCallback != nil {
+		q.opts.StderrCallback(fmt.Sprintf("[clawde] handleHookCallback: event=%s matchers=%d tool=%s", event, len(matchers), req.Input.ToolName))
+	}
+
+	for i, matcher := range matchers {
 		// Check if matcher applies to this tool
 		if matcher.ToolName != "*" && matcher.ToolName != req.Input.ToolName {
+			if q.opts.StderrCallback != nil {
+				q.opts.StderrCallback(fmt.Sprintf("[clawde] handleHookCallback: matcher[%d] skipped (tool mismatch: %s != %s)", i, matcher.ToolName, req.Input.ToolName))
+			}
 			continue
+		}
+
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleHookCallback: matcher[%d] matched, calling callback", i))
 		}
 
 		// Apply timeout if specified
@@ -355,6 +446,11 @@ func (q *QueryHandler) handleHookCallback(ctx context.Context, req *HookCallback
 		if cancel != nil {
 			cancel()
 		}
+
+		if q.opts.StderrCallback != nil {
+			q.opts.StderrCallback(fmt.Sprintf("[clawde] handleHookCallback: callback returned err=%v output=%+v", err, output))
+		}
+
 		if err != nil {
 			return &HookCallbackResponse{
 				Continue: false,
@@ -374,6 +470,9 @@ func (q *QueryHandler) handleHookCallback(ctx context.Context, req *HookCallback
 		}
 	}
 
+	if q.opts.StderrCallback != nil {
+		q.opts.StderrCallback("[clawde] handleHookCallback: returning continue=true")
+	}
 	return &HookCallbackResponse{Continue: true}
 }
 
